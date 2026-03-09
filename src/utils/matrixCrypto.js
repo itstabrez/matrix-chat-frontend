@@ -59,7 +59,7 @@ export function createInboundSession(sessionKey) {
   return session;
 }
 
-export function decryptMessage(inboundSession, ciphertext) {
-  const result = inboundSession.decrypt(ciphertext);
-  return { plaintext: result.plaintext, messageIndex: result.message_index };
+export function decryptMessage(session, ciphertext) {
+  const result = session.decrypt(ciphertext);
+  return JSON.parse(result.plaintext);
 }

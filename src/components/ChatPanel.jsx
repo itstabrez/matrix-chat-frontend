@@ -1,6 +1,9 @@
-import { useEffect, useRef, useState } from "react";
-import { Box, Typography, TextField, Paper, Button } from "@mui/material";
+import { useEffect, useRef, useState, useCallback } from "react";
+import { Box, Typography, TextField, Paper, Button, CircularProgress } from "@mui/material";
 import axios from "axios";
+import { useUnread } from "./UnreadContext";
+import ShowingEventCard from "./ShowingEventCard";
+
 import {
   initOlm,
   createOrLoadAccount,
@@ -8,431 +11,614 @@ import {
   generateOneTimeKeys,
   createOutboundSession,
   encryptMessage,
-  createInboundSession,
+  createInboundSession
 } from "../utils/matrixCrypto.js";
 
-const megolmOutboundSessions = {};
-const megolmInboundSessions = {};
+const API = "http://localhost:8080/api/matrix";
+
+// Module-level — survive React re-renders, cleared on full page reload
+const inboundSessions = {};   // sessionId  → Olm.InboundGroupSession
+const outboundByRoom  = {};   // roomId     → Olm.OutboundGroupSession
+const outboundById    = {};   // sessionId  → Olm.OutboundGroupSession
 
 export default function ChatPanel({ roomId }) {
-  const token = localStorage.getItem("token");
+
+  const token  = localStorage.getItem("token");
   const userId = localStorage.getItem("userId");
+  const { markRead } = useUnread();
 
   const [messages, setMessages] = useState([]);
-  const [input, setInput] = useState("");
-  const [olmInitialized, setOlmInitialized] = useState(false);
-  const bottomRef = useRef(null);
-  const syncingRef = useRef(false); // prevent double sync loops
-  const processedEvents = useRef(new Set());
-  const activeRoomRef = useRef(roomId);   // ← add this
-  const [historyToken, setHistoryToken] = useState(null);
-  // ── Step 1: Init Olm + upload device keys (runs once) ───────────────────────
+  const [input,    setInput]    = useState("");
+  const [olmReady, setOlmReady] = useState(false);
+  const [loading,  setLoading]  = useState(true);
+
+  const processedEventIds = useRef(new Set());
+  const syncAbort         = useRef({ cancelled: false });
+  const bottomRef         = useRef(null);
+  const paperRef          = useRef(null);   // scroll container ref for pagination
+
+  const [historyToken,  setHistoryToken]  = useState(null);  // Matrix 'end' token for older pages
+  const [loadingMore,   setLoadingMore]   = useState(false);
+  const hasMoreHistory  = useRef(true);   // false once server returns no more events
+
+  /* ─────────────────────────────────────────
+     1.  INIT OLM  (once on mount)
+  ───────────────────────────────────────── */
   useEffect(() => {
+    let mounted = true;
     (async () => {
-      try {
-        await initOlm();
-
-        const acc = createOrLoadAccount();
-        const deviceKeys = getDeviceKeys(acc);
-        const oneTimeKeys = generateOneTimeKeys(acc);
-
-        // Upload keys — userId passed as query param to match @RequestParam
-        await axios.post(
-          `http://localhost:8080/api/matrix/keys/upload?userId=${encodeURIComponent(userId)}`,
-          { deviceKeys, oneTimeKeys },
-          { headers: { Authorization: `Bearer ${token}` } }
-        );
-
-        console.log("✅ Olm initialized & keys uploaded");
-        setOlmInitialized(true);
-      } catch (err) {
-        console.error("❌ Olm init failed:", err);
-      }
-    })();
-  }, []); // runs once on mount
-
-  const sendShowingRequest = async () => {
-
-    if (!olmInitialized) return;
-
-    const nowEpoch = Date.now(); // milliseconds epoch
-
-    const showingPayload = {
-      type: "property.showing.request",
-      payload: {
-        requestId: "REQ_" + nowEpoch,
-        propertyId: "PROP_123",
-        address: "221B Baker Street",
-        showingTime: nowEpoch + (60 * 60 * 1000) // 1 hour later
-      },
-      metadata: {
-        createdAt: nowEpoch
-      },
-      ui: {
-        actions: ["accept", "decline"]
-      }
-    };
-
-    try {
-
-      const session = await getOrCreateOutboundSession();
-
-      const plaintext = JSON.stringify(showingPayload);
-
-      const ciphertext = encryptMessage(session, plaintext);
-
-      // Show locally
-      setMessages(prev => [
-        ...prev,
-        {
-          sender: userId,
-          ...showingPayload
-        }
-      ]);
+      await initOlm();
+      const account     = createOrLoadAccount();
+      const deviceKeys  = getDeviceKeys(account);
+      const oneTimeKeys = generateOneTimeKeys(account);
 
       await axios.post(
-        `http://localhost:8080/api/matrix/rooms/${roomId}/message`,
-        {
-          encrypted: true,
-          senderUserId: userId,
-          sessionId: session.session_id(),
-          ciphertext
-        },
+        `${API}/keys/upload?userId=${encodeURIComponent(userId)}`,
+        { deviceKeys, oneTimeKeys },
         { headers: { Authorization: `Bearer ${token}` } }
       );
 
-    } catch (err) {
-      console.error("Showing request failed", err);
-    }
-  };
-
-  // ── Step 2: Load pending inbound sessions from backend ───────────────────────
-  // So receiver can decrypt messages sent before they synced
-  useEffect(() => {
-    if (!olmInitialized || !userId) return;
-
-    (async () => {
-      try {
-        const res = await axios.get(
-          `http://localhost:8080/api/matrix/sessions/pending?userId=${encodeURIComponent(userId)}`,
-          { headers: { Authorization: `Bearer ${token}` } }
-        );
-
-        res.data.forEach((session) => {
-          if (!megolmInboundSessions[session.sessionId]) {
-            megolmInboundSessions[session.sessionId] = createInboundSession(session.sessionKey);
-            console.log("📬 Loaded inbound session:", session.sessionId);
-          }
-        });
-      } catch (err) {
-        console.error("❌ Failed to load pending sessions:", err);
-      }
+      if (mounted) setOlmReady(true);
     })();
-  }, [olmInitialized]);
+    return () => { mounted = false; };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Step 3: Start sync loop only after Olm is ready ─────────────────────────
-  useEffect(() => {
-    if (!olmInitialized) return;
-
-    activeRoomRef.current = roomId;      // ← add this
-    syncingRef.current = false;
-    processedEvents.current = new Set();
-    setMessages([]);
-    loadChatHistory();   // ← load history first
-
-    syncMessages(null);  // ← then start live sync
-    return () => {
-      syncingRef.current = true;
-    };
-  }, [roomId, olmInitialized]);
-
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
-
-  const formatEpoch = (epoch) => {
-
-    if (!epoch) return "";
-
-    const date = new Date(epoch);
-
-    return date.toLocaleString();
-  };
-
-  // ── Long poll sync ───────────────────────────────────────────────────────────
-  const syncMessages = async (sinceToken) => {
-    if (syncingRef.current) return;
-
-    try {
-      const res = await axios.get("http://localhost:8080/api/matrix/sync", {
-        headers: { Authorization: `Bearer ${token}` },
-        params: { since: sinceToken },
-      });
-
-      if (syncingRef.current) return; // room changed while waiting
-
-      const data = res.data;
-      const nextBatch = data.next_batch;
-
-      const roomEvents = data.rooms?.join?.[activeRoomRef.current]?.timeline?.events || [];
-
-      const newMessages = [];
-
-      for (const event of roomEvents) {
-        if (event.type !== "m.room.encrypted" && event.type !== "m.room.message") continue;
-
-        // ✅ Deduplicate by event_id
-        const eventId = event.event_id;
-        if (eventId && processedEvents.current.has(eventId)) continue;
-        if (eventId) processedEvents.current.add(eventId);
-
-        // ✅ Skip own messages — already shown locally on send
-        if (event.sender === userId) continue;
-
-        if (event.type === "m.room.encrypted") {
-          const { session_id, ciphertext, decrypted_body } = event.content;
-
-          // Use backend-decrypted body if injected
-          // if (decrypted_body) {
-          //   newMessages.push({ sender: event.sender, body: decrypted_body });
-          //   continue;
-          // }
-          console.log("Known sessions:", Object.keys(megolmInboundSessions));
-          console.log("Incoming session:", session_id);
-          // Fallback: local inbound session
-          const session = megolmInboundSessions[session_id];
-          console.log("Session lookup for", session)
-          if (!session) {
-            newMessages.push({ sender: event.sender, body: "🔐 [Encrypted — no session key]" });
-            continue;
-          }
-
-          try {
-
-            const result = session.decrypt(ciphertext);
-
-            const parsed = JSON.parse(result.plaintext);
-
-            newMessages.push({
-              sender: event.sender,
-              type: parsed.type,
-              payload: parsed.payload,
-              metadata: parsed.metadata,
-              ui: parsed.ui
-            });
-
-          } catch {
-            newMessages.push({
-              sender: event.sender,
-              body: "⚠️ [Decryption failed]"
-            });
-          }
-
-        } else {
-          newMessages.push({ sender: event.sender, body: event.content.body });
-        }
-      }
-
-      if (newMessages.length > 0) {
-        setMessages((prev) => [...prev, ...newMessages]);
-      }
-
-      if (!syncingRef.current) {
-        syncMessages(nextBatch || sinceToken);
-      }
-
-    } catch (err) {
-      console.error("Sync error", err);
-      if (!syncingRef.current) {
-        setTimeout(() => syncMessages(sinceToken), 3000);
-      }
-    }
-  };
-
-  // ── Get or create outbound Megolm session ────────────────────────────────────
-  const getOrCreateOutboundSession = async () => {
-    if (megolmOutboundSessions[roomId]) {
-      return megolmOutboundSessions[roomId];
-    }
-
-    const session = createOutboundSession();
-    megolmOutboundSessions[roomId] = session;
-
-    // ✅ DO NOT create inbound session here — causes BAD_SIGNATURE
-    // Sender reads their own messages from localSentMessages instead
-
-    await axios.post(
-      `http://localhost:8080/api/matrix/rooms/${roomId}/share-keys?senderUserId=${encodeURIComponent(userId)}`,
-      { sessionId: session.session_id(), sessionKey: session.session_key() },
+  /* ─────────────────────────────────────────
+     2.  LOAD SESSION KEYS FROM SERVER
+         Safe to call multiple times — only
+         creates a new session object if one
+         doesn't already exist for that id.
+  ───────────────────────────────────────── */
+  const loadSessions = useCallback(async () => {
+    const res = await axios.get(
+      `${API}/sessions/pending?userId=${encodeURIComponent(userId)}`,
       { headers: { Authorization: `Bearer ${token}` } }
     );
 
-    console.log("🔑 Session key shared for room:", roomId);
-    return session;
-  };
+    for (const s of res.data) {
+      const { sessionId, sessionKey, roomId: sRoom, senderUserId } = s;
 
-  // ── Send message ─────────────────────────────────────────────────────────────
-  const sendMessage = async () => {
-    if (!input.trim() || !olmInitialized) return;
+      // Always build an inbound session — both sender and recipient need this
+      if (!inboundSessions[sessionId]) {
+        inboundSessions[sessionId] = createInboundSession(sessionKey);
+      }
 
-    const currentInput = input;  // capture before clearing
-    setInput("");                // clear immediately for UX
+      // FIX — Reload session reuse: restore the outbound session from DB so
+      // we keep using the same sessionId instead of creating a new one on
+      // every page reload and forcing recipients to re-fetch keys.
+      if (senderUserId === userId && !outboundByRoom[sRoom]) {
+        try {
+          const outbound = createOutboundSession();
+          outbound.import_session(sessionKey);
+          outboundByRoom[sRoom]   = outbound;
+          outboundById[sessionId] = outbound;
+        } catch {
+          // import_session not available in this OLM build — a fresh session
+          // will be created on next send and shared automatically.
+        }
+      }
+    }
+  }, [userId, token]);
+
+  /* ─────────────────────────────────────────
+     3.  DECRYPT A SINGLE EVENT
+  ───────────────────────────────────────── */
+  const decryptEvent = useCallback((event) => {
+    if (event.type !== "m.room.encrypted" && event.type !== "m.room.message") {
+      return null;
+    }
+
+    if (event.type === "m.room.message") {
+      const raw = event.content.body ?? "";
+      try {
+        const parsed = JSON.parse(raw);
+        // Server-sent showing status event (accepted / declined / rescheduled)
+        if (parsed.type?.startsWith("property.showing.")) {
+          return {
+            eventId: event.event_id,
+            sender:  event.sender,
+            ts:      event.origin_server_ts ?? Date.now(),
+            ...parsed,
+          };
+        }
+      } catch { /* not JSON — fall through to plain text */ }
+      return {
+        eventId: event.event_id,
+        sender:  event.sender,
+        type:    "m.text",
+        body:    raw,
+        ts:      event.origin_server_ts ?? Date.now(),
+      };
+    }
+
+    const { session_id, ciphertext } = event.content;
+    const session = inboundSessions[session_id];
+
+    if (!session) return null; // caller must loadSessions first
 
     try {
-      const session = await getOrCreateOutboundSession();
-      const plaintext = JSON.stringify({ type: "m.text", body: currentInput });
-      const ciphertext = encryptMessage(session, plaintext);
+      const result = session.decrypt(ciphertext);
+      const parsed = JSON.parse(result.plaintext);
+      return {
+        eventId: event.event_id,
+        sender:  event.sender,
+        ts:      event.origin_server_ts ?? Date.now(),
+        ...parsed,
+      };
+    } catch {
+      return {
+        eventId: event.event_id,
+        sender:  event.sender,
+        ts:      event.origin_server_ts ?? Date.now(),
+        type:    "m.text",
+        body:    "🔐 [Already decrypted]",
+      };
+    }
+  }, []);
 
-      // ✅ Add own message to UI immediately — no need to decrypt later
-      const eventId = `local_${Date.now()}`;
-      processedEvents.current.add(eventId);  // mark as processed so sync skips it
-      setMessages((prev) => [...prev, { sender: userId, body: currentInput }]);
+  /* ─────────────────────────────────────────
+     4.  LOAD HISTORY
+  ───────────────────────────────────────── */
+  const loadHistory = useCallback(async (currentRoomId) => {
+    const res = await axios.get(
+      `${API}/rooms/${currentRoomId}/history`,
+      {
+        headers: { Authorization: `Bearer ${token}` },
+        params:  { limit: 20 },
+      }
+    );
 
-      await axios.post(
-        `http://localhost:8080/api/matrix/rooms/${roomId}/message`,
+    const events = (res.data.chunk || []).reverse();
+
+    const parsed = [];
+    let lastEventId = null;
+
+    for (const event of events) {
+      if (!event.event_id) continue;
+      if (processedEventIds.current.has(event.event_id)) continue;
+      const msg = decryptEvent(event);
+      if (msg) {
+        processedEventIds.current.add(event.event_id);
+        parsed.push(msg);
+        lastEventId = event.event_id;
+      }
+    }
+
+    const pageToken = res.data.end ?? null;
+    setHistoryToken(pageToken);
+    if (!pageToken || events.length < 20) hasMoreHistory.current = false;
+
+    setMessages(parsed);
+    return lastEventId; // caller sends read receipt with this
+  }, [token, decryptEvent]);
+
+  /* ─────────────────────────────────────────
+     4b. LOAD MORE HISTORY  (pagination)
+         Triggered when user scrolls to top.
+         Prepends older messages without
+         disturbing the current scroll position.
+  ───────────────────────────────────────── */
+  const loadMoreHistory = useCallback(async () => {
+    if (loadingMore || !hasMoreHistory.current || !historyToken) return;
+
+    setLoadingMore(true);
+
+    try {
+      const res = await axios.get(
+        `${API}/rooms/${roomId}/history`,
         {
-          encrypted: true,
+          headers: { Authorization: `Bearer ${token}` },
+          params:  { limit: 20, from: historyToken },
+        }
+      );
+
+      const events = (res.data.chunk || []).reverse();
+      const nextToken = res.data.end ?? null;
+
+      setHistoryToken(nextToken);
+      if (!nextToken || events.length < 20) hasMoreHistory.current = false;
+
+      const parsed = [];
+      for (const event of events) {
+        if (!event.event_id) continue;
+        if (processedEventIds.current.has(event.event_id)) continue;
+        const msg = decryptEvent(event);
+        if (msg) {
+          processedEventIds.current.add(event.event_id);
+          parsed.push(msg);
+        }
+      }
+
+      if (parsed.length > 0) {
+        // Preserve scroll position — measure before prepend, restore after
+        const container = paperRef.current;
+        const prevScrollHeight = container?.scrollHeight ?? 0;
+
+        setMessages(prev => [...parsed, ...prev]);
+
+        // After React renders the new messages, restore the scroll offset
+        requestAnimationFrame(() => {
+          if (container) {
+            container.scrollTop = container.scrollHeight - prevScrollHeight;
+          }
+        });
+      }
+    } catch (err) {
+      console.error("Load more history failed", err);
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [roomId, token, historyToken, loadingMore, decryptEvent]);
+
+  /* ─────────────────────────────────────────
+     5.  SYNC LOOP  (long-poll)
+  ───────────────────────────────────────── */
+  const syncLoop = useCallback(async (since, abort, currentRoomId) => {
+    if (abort.cancelled) return;
+
+    try {
+      const res = await axios.get(`${API}/sync`, {
+        headers: { Authorization: `Bearer ${token}` },
+        params:  { since },
+      });
+
+      if (abort.cancelled) return;
+
+      const data   = res.data;
+      const events = data.rooms?.join?.[currentRoomId]?.timeline?.events ?? [];
+
+      // ── KEY FIX: detect unknown session_ids ───────────────────────────
+      // The other user may have reloaded (creating a new outbound session)
+      // or joined fresh.  Their share-keys call saved a new row for us in
+      // room_session.  We detect this by checking if any encrypted event
+      // carries a session_id we have no inbound session for, then fetch.
+      const hasUnknownSession = events.some(
+        e => e.type === "m.room.encrypted"
+          && e.content?.session_id
+          && !inboundSessions[e.content.session_id]
+      );
+
+      if (hasUnknownSession) {
+        await loadSessions();
+      }
+
+      const newMessages = [];
+      for (const event of events) {
+        const id = event.event_id;
+        if (!id || processedEventIds.current.has(id)) continue;
+        const msg = decryptEvent(event);
+        if (msg) {
+          processedEventIds.current.add(id);
+          newMessages.push(msg);
+        }
+      }
+
+      if (newMessages.length) {
+        setMessages(prev => [...prev, ...newMessages]);
+        // Mark last received event as read so server resets notification_count
+        const lastEvent = events[events.length - 1];
+        if (lastEvent?.event_id) {
+          sendReadReceipt(lastEvent.event_id);
+        }
+      }
+
+      syncLoop(data.next_batch, abort, currentRoomId);
+
+    } catch {
+      if (!abort.cancelled) {
+        setTimeout(() => syncLoop(since, abort, currentRoomId), 3000);
+      }
+    }
+  }, [token, decryptEvent, loadSessions]);
+
+  /* ─────────────────────────────────────────
+     6.  ROOM CHANGE EFFECT
+  ───────────────────────────────────────── */
+  useEffect(() => {
+    if (!olmReady) return;
+
+    markRead(roomId);   // clear unread dot as soon as room is opened
+
+    syncAbort.current.cancelled = true;
+    const abort = { cancelled: false };
+    syncAbort.current = abort;
+
+    processedEventIds.current.clear();
+    setMessages([]);
+    setHistoryToken(null);
+    hasMoreHistory.current = true;
+    setLoading(true);
+
+    (async () => {
+      try {
+        await loadSessions();
+        const lastEventId = await loadHistory(roomId);
+        // Send read receipt so Matrix server resets notification_count
+        if (lastEventId) sendReadReceipt(lastEventId);
+        // Scroll to bottom instantly before revealing messages so user never
+        // sees the content flash from top → bottom
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            bottomRef.current?.scrollIntoView({ behavior: "instant" });
+            setLoading(false);
+          });
+        });
+        syncLoop(null, abort, roomId);
+      } catch (err) {
+        console.error("Room init error", err);
+        setLoading(false);
+      }
+    })();
+
+    return () => { abort.cancelled = true; };
+  }, [roomId, olmReady]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /* ─────────────────────────────────────────
+     7.  AUTO-SCROLL
+         On initial load  → instant jump (no animation, so user never sees top)
+         On new messages  → smooth scroll (only when already near bottom)
+  ───────────────────────────────────────── */
+  useEffect(() => {
+    if (loading) return; // don't scroll while hidden — wait for reveal
+
+    const container = paperRef.current;
+    if (!container) return;
+
+    const distFromBottom =
+      container.scrollHeight - container.scrollTop - container.clientHeight;
+
+    // If within 150px of bottom (or just loaded), scroll to bottom.
+    // This prevents hijacking scroll when user is reading old messages.
+    if (distFromBottom < 150) {
+      bottomRef.current?.scrollIntoView({ behavior: messages.length <= 20 ? "instant" : "smooth" });
+    }
+  }, [messages, loading]);
+
+  /* ─────────────────────────────────────────
+     8.  SESSION MANAGEMENT
+  ───────────────────────────────────────── */
+  const getOrCreateOutboundSession = async () => {
+    if (outboundByRoom[roomId]) return outboundByRoom[roomId];
+
+    const session    = createOutboundSession();
+    const sessionId  = session.session_id();
+    const sessionKey = session.session_key();
+
+    outboundByRoom[roomId]   = session;
+    outboundById[sessionId]  = session;
+    inboundSessions[sessionId] = createInboundSession(sessionKey);
+
+    await axios.post(
+      `${API}/rooms/${roomId}/share-keys?senderUserId=${encodeURIComponent(userId)}`,
+      { sessionId, sessionKey },
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+
+    return session;
+  };
+  /* ─────────────────────────────────────────
+       8b. SEND READ RECEIPT
+           Tells Matrix server this user has read
+           up to this eventId — server resets
+           notification_count to 0 for this room
+           in all subsequent sync responses.
+    ───────────────────────────────────────── */
+  const sendReadReceipt = async (eventId) => {
+    if (!eventId) return;
+    try {
+      await axios.post(
+        `${API}/rooms/${roomId}/receipt`,
+        {},
+        {
+          headers: { Authorization: `Bearer ${token}` },
+          params: { eventId },   // passed as ?eventId=... avoids path encoding issues
+        }
+      );
+    } catch (err) {
+      console.error("Read receipt failed", err);
+    }
+  };
+
+  /* ─────────────────────────────────────────
+     9.  SEND TEXT MESSAGE
+         FIX: No optimistic render.
+         Sync is the single source of truth.
+         The sender's own event comes back via
+         the sync loop and is decrypted normally
+         via inboundSessions — no echo possible.
+         On failure the input text is restored.
+  ───────────────────────────────────────── */
+  const sendMessage = async () => {
+    const text = input.trim();
+    if (!text) return;
+
+    setInput("");
+
+    const session    = await getOrCreateOutboundSession();
+    const payload    = { type: "m.text", body: text };
+    const ciphertext = encryptMessage(session, JSON.stringify(payload));
+
+    try {
+      await axios.post(
+        `${API}/rooms/${roomId}/message`,
+        {
+          encrypted:    true,
           senderUserId: userId,
-          message: currentInput,
-          sessionId: session.session_id(),
+          sessionId:    session.session_id(),
           ciphertext,
         },
         { headers: { Authorization: `Bearer ${token}` } }
       );
-
     } catch (err) {
-      console.error("❌ Send failed:", err);
+      console.error("Send failed", err);
+      setInput(text); // restore so user can retry
     }
   };
 
-  const loadChatHistory = async () => {
-
+  /* ─────────────────────────────────────────
+     10. SHOWING ACTION  (accept/decline/reschedule)
+         Calls the backend endpoint which builds
+         the encrypted message server-side and
+         sends it to the Matrix room.  The message
+         arrives back via the sync loop for all
+         clients including the sender.
+  ───────────────────────────────────────── */
+  // actionType: REQUESTED | ACCEPTED | DECLINED | RESCHEDULED
+  // proposedTime: ISO datetime string from the reschedule picker (converted to epoch ms)
+  const sendShowingAction = async (actionType, showingPayload, proposedTimeIso = null) => {
     try {
-
-      const res = await axios.get(
-        `http://localhost:8080/api/matrix/rooms/${roomId}/history`,
+      await axios.post(
+        `${API}/rooms/${roomId}/showing-event`,
         {
-          headers: { Authorization: `Bearer ${token}` },
-          params: { limit: 20 }
-        }
+          actionType,
+          actorUserId:  userId,
+          propertyId:   showingPayload?.propertyId,
+          address:      showingPayload?.address,
+          agentUserId:  showingPayload?.agentUserId,
+          buyerUserId:  showingPayload?.buyerUserId,
+          proposedTime: proposedTimeIso ? new Date(proposedTimeIso).getTime() : null,
+        },
+        { headers: { Authorization: `Bearer ${token}` } }
       );
-      setHistoryToken(res.data.end);
-      const events = res.data.chunk || [];
-
-      const historyMessages = [];
-
-      for (const event of events) {
-
-        if (event.type !== "m.room.encrypted") continue;
-
-        const { session_id, ciphertext } = event.content;
-
-        let session = megolmInboundSessions[session_id];
-
-        if (!session && event.sender === userId) {
-          session = megolmOutboundSessions[roomId];
-        }
-
-        if (!session) {
-          historyMessages.push({
-            sender: event.sender,
-            body: "🔐 [Encrypted — session not available]"
-          });
-          continue;
-        }
-
-        try {
-
-          const result = session.decrypt(ciphertext);
-
-          const parsed = JSON.parse(result.plaintext);
-
-          historyMessages.push({
-            sender: event.sender,
-            ...parsed
-          });
-
-        } catch {
-          console.warn("History decryption failed");
-        }
-      }
-      // reverse because Matrix returns newest first
-      setMessages(historyMessages.reverse());
-
     } catch (err) {
-      console.error("History fetch failed", err);
+      console.error("Showing action failed", err);
     }
-
   };
 
+  /* ─────────────────────────────────────────
+     11. SEND SHOWING REQUEST
+         Uses showing-event endpoint so it is
+         stored in chat_events and rendered via
+         ShowingEventCard with action buttons.
+  ───────────────────────────────────────── */
+  const sendShowingRequest = async () => {
+    await sendShowingAction("REQUESTED", {
+      propertyId:  "PROP123",
+      address:     "221B Baker Street",
+      agentUserId: userId,
+      buyerUserId: null,
+    });
+  };
+
+  /* ─────────────────────────────────────────
+     UI
+  ───────────────────────────────────────── */
   return (
     <Box p={2} display="flex" flexDirection="column" height="100%">
-      <Typography variant="h6">
-        🔐 Room: {roomId}
-        {!olmInitialized && (
-          <Typography component="span" variant="caption" color="warning.main" ml={1}>
-            (initializing encryption...)
+      <Typography variant="h6">🔐 Room {roomId}</Typography>
+
+      {/* Full-area loader shown while history is fetching — overlays the Paper */}
+      {loading && (
+        <Box sx={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", mt: 2, mb: 2 }}>
+          <CircularProgress size={32} />
+        </Box>
+      )}
+
+      <Paper
+        ref={paperRef}
+        sx={{ flex: 1, p: 2, mt: 2, mb: 2, overflow: loading ? "hidden" : "auto", visibility: loading ? "hidden" : "visible" }}
+        onScroll={e => {
+          if (e.currentTarget.scrollTop < 80 && !loadingMore && hasMoreHistory.current) {
+            loadMoreHistory();
+          }
+        }}
+      >
+
+        {loadingMore && (
+          <Box display="flex" justifyContent="center" pb={1}>
+            <CircularProgress size={18} />
+          </Box>
+        )}
+
+        {!hasMoreHistory.current && !loading && (
+          <Typography variant="caption" color="text.secondary" display="block" textAlign="center" pb={1}>
+            — beginning of conversation —
           </Typography>
         )}
-      </Typography>
 
-      <Box flex={1} overflow="auto" mt={2} mb={2} component={Paper} sx={{ p: 2 }}>
-        {messages.map((msg, index) => {
+        {!loading && messages.length === 0 && (
+          <Typography variant="body2" color="text.secondary">
+            No messages yet. Start the conversation 👋
+          </Typography>
+        )}
 
-          if (msg.type === "property.showing.request") {
+        {messages.map((msg, i) => {
+
+
+          // ── All showing event types → unified ShowingEventCard ──────────
+          if (msg.type?.startsWith("property.showing.")) {
+            // Build a map of propertyId → latest eventId so only the most
+            // recent card for each property shows action buttons.
+            // Computed inline here — messages array is already in order.
+            const latestEventIdByProperty = {};
+            messages.forEach(m => {
+              if (m.type?.startsWith("property.showing.") && m.payload?.propertyId) {
+                latestEventIdByProperty[m.payload.propertyId] = m.eventId;
+              }
+            });
+            const isLatest = latestEventIdByProperty[msg.payload?.propertyId] === msg.eventId;
 
             return (
-              <Paper key={index} sx={{ p: 2, mb: 1, background: "#f5f5f5" }}>
-
-                <Typography>
-                  🏠 Showing Request
-                </Typography>
-
-                <Typography>
-                  Property: {msg.payload?.address}
-                </Typography>
-
-                <Typography>
-                  Showing Time: {formatEpoch(msg.payload?.showingTime)}
-                </Typography>
-
-                <Typography variant="caption">
-                  Requested At: {formatEpoch(msg.metadata?.createdAt)}
-                </Typography>
-
-                <Box mt={1}>
-                  <Button size="small" variant="contained">
-                    Accept
-                  </Button>
-
-                  <Button size="small" color="error" sx={{ ml: 1 }}>
-                    Decline
-                  </Button>
-                </Box>
-
-              </Paper>
+              <ShowingEventCard
+                key={msg.eventId ?? i}
+                msg={msg}
+                currentUserId={userId}
+                isLatest={isLatest}
+                onAction={(action, payload, proposedTimeIso) =>
+                  sendShowingAction(action, payload, proposedTimeIso)}
+              />
             );
           }
 
+
+          const isMine = msg.sender === userId;
           return (
-            <Box key={index} mb={1}>
-              <strong>{msg.sender}</strong>: {msg.body}
+            <Box
+              key={msg.eventId ?? i}
+              mb={1}
+              display="flex"
+              justifyContent={isMine ? "flex-end" : "flex-start"}
+            >
+              <Box
+                sx={{
+                  maxWidth:     "70%",
+                  bgcolor:      isMine ? "primary.main" : "grey.200",
+                  color:        isMine ? "white" : "text.primary",
+                  borderRadius: 2,
+                  px: 1.5,
+                  py: 0.75,
+                }}
+              >
+                {!isMine && (
+                  <Typography variant="caption" display="block" sx={{ opacity: 0.7 }}>
+                    {msg.sender}
+                  </Typography>
+                )}
+                <Typography variant="body2">{msg.body}</Typography>
+              </Box>
             </Box>
           );
-
         })}
+
         <div ref={bottomRef} />
-      </Box>
-      <Button onClick={sendShowingRequest} disabled={!olmInitialized} variant="outlined" sx={{ mb: 1 }}>
-        Request Showing
+      </Paper>
+
+      <Button
+        variant="outlined"
+        onClick={sendShowingRequest}
+        sx={{ mb: 1 }}
+        disabled={!olmReady}
+      >
+        🏠 Send Showing Request
       </Button>
+
       <TextField
         fullWidth
-        disabled={!olmInitialized}
-        placeholder={olmInitialized ? "Type message and press Enter... (E2E Encrypted 🔐)" : "Initializing encryption..."}
+        placeholder="Type a message…"
         value={input}
-        onChange={(e) => setInput(e.target.value)}
-        onKeyDown={(e) => { if (e.key === "Enter") sendMessage(); }}
+        onChange={e => setInput(e.target.value)}
+        onKeyDown={e => e.key === "Enter" && !e.shiftKey && sendMessage()}
+        disabled={!olmReady}
       />
     </Box>
   );

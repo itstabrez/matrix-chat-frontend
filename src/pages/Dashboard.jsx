@@ -14,6 +14,8 @@ import JoinRoomModal from "../components/JoinRoomModal";
 import ChatPanel from "../components/ChatPanel";
 import axios from "axios";
 import InviteUserModal from "../components/InviteUserModal";
+import { useUnread } from "../components/UnreadContext.jsx";
+import { useGlobalSync } from "../components/useGlobalSync";
 
 export default function Dashboard() {
   const [rooms, setRooms] = useState([]);
@@ -21,8 +23,9 @@ export default function Dashboard() {
   const [openCreate, setOpenCreate] = useState(false);
   const [openJoin, setOpenJoin] = useState(false);
   const [openInvite, setOpenInvite] = useState(false);
-
+  const { unreadCounts } = useUnread();
   const token = localStorage.getItem("token");
+  useGlobalSync(selectedRoom);   // ← add this line
 
   const fetchRooms = async () => {
     const res = await axios.get("http://localhost:8080/api/matrix/rooms", {
@@ -52,14 +55,25 @@ export default function Dashboard() {
         </Box>
 
         <List>
-          {rooms.map((room) => (
-            <ListItemButton
-              key={room.roomId}
-              onClick={() => setSelectedRoom(room.roomId)}
-            >
-              <ListItemText primary={room.roomId} />
-            </ListItemButton>
-          ))}
+          {rooms.map((room) => {
+            const unread = unreadCounts[room.roomId] ?? 0;
+            return (
+              <ListItemButton
+                key={room.roomId}
+                onClick={() => setSelectedRoom(room.roomId)}
+                sx={{ fontWeight: unread ? "bold" : "normal" }}
+              >
+                <ListItemText primary={room.roomId} />
+                {unread > 0 && (
+                  <Box sx={{
+                    width: 10, height: 10,
+                    borderRadius: "50%",
+                    bgcolor: "error.main",
+                  }} />
+                )}
+              </ListItemButton>
+            );
+          })}
         </List>
       </Box>
 
