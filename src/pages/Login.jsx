@@ -29,6 +29,7 @@ export default function Login() {
             const res = await loginUser(form);
             localStorage.setItem("token", res.data.accessToken);
             localStorage.setItem("userId", res.data.userId);
+            sessionStorage.setItem("password", form?.password);
             console.log("Login Success:", res.data);
             navigate("/dashboard");
         } catch (err) {
